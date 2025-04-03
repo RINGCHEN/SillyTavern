@@ -858,10 +858,25 @@ async function openAdminPanel() {
  * @returns {Promise<void>}
  */
 async function logout() {
-    await fetch('/api/users/logout', {
-        method: 'POST',
-        headers: getRequestHeaders(),
-    });
+    try {
+        // First try the standard logout
+        await fetch('/api/users/logout', {
+            method: 'POST',
+            headers: getRequestHeaders(),
+        });
+
+        // Then try LoI logout if we were authenticated via LoI
+        const loiResponse = await fetch('/auth/logout', {
+            method: 'POST',
+            headers: getRequestHeaders(),
+        });
+
+        if (!loiResponse.ok) {
+            console.log('LoI logout failed - may not have been logged in via LoI');
+        }
+    } catch (error) {
+        console.error('Error during logout:', error);
+    }
 
     // On an explicit logout stop auto login
     // to allow user to change username even

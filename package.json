@@ -122,6 +122,7 @@
         "@types/cors": "^2.8.17",
         "@types/deno": "^2.2.0",
         "@types/express": "^4.17.21",
+        "@types/helmet": "^0.0.48",
         "@types/jquery": "^3.5.32",
         "@types/jquery-cropper": "^1.0.4",
         "@types/jquery.transit": "^0.9.33",

@@ -7,6 +7,7 @@ import net from 'node:net';
 import dns from 'node:dns';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
+import crypto from 'node:crypto';
 
 import cors from 'cors';
 import { csrfSync } from 'csrf-sync';
@@ -18,6 +19,7 @@ import responseTime from 'response-time';
 import helmet from 'helmet';
 import bodyParser from 'body-parser';
 import open from 'open';
+import fetch from 'node-fetch'; // Added for making requests to LoI
 
 // local library imports
 import { serverEvents, EVENT_NAMES } from './src/server-events.js';
@@ -190,13 +192,127 @@ if (!cliArgs.disableCsrf) {
     csrfSyncProtection.invalidCsrfTokenError.message = color.red('Invalid CSRF token. Please refresh the page and try again.');
     csrfSyncProtection.invalidCsrfTokenError.stack = undefined;
 
+    // Route to initiate login flow with LoI backend
+    app.get('/auth/initiate-loi-login', (req, res) => {
+        if (!req.session) {
+            console.error('Session not available for initiating LoI login.');
+            return res.status(500).json({ error: 'Session unavailable.' });
+        }
+
+        // Generate a random state parameter for CSRF protection
+        const state = crypto.randomBytes(16).toString('hex');
+
+        // Store the state in the session
+        // We'll use this later in the callback to verify the request origin
+        req.session.loiAuthState = state;
+
+        // TODO: Get LoI base URL from config/environment variable
+        const loiBaseUrl = process.env.LOI_BASE_URL || 'https://your-loi-backend.onrender.com'; // Replace with actual LoI URL
+        const loiInitiateUrl = `${loiBaseUrl}/auth/st-initiate/?state=${state}`;
+
+        console.log(`Initiating LoI login. State: ${state}. Redirect URL: ${loiInitiateUrl}`); // Log for debugging
+
+        // Send the URL back to the frontend
+        res.json({ loiAuthUrl: loiInitiateUrl });
+    });
+
     app.use(csrfSyncProtection.csrfSynchronisedProtection);
-} else {
+} else { // CSRF is disabled
     console.warn('\nCSRF protection is disabled. This will make your server vulnerable to CSRF attacks.\n');
     app.get('/csrf-token', (req, res) => {
         res.json({
             'token': 'disabled',
         });
+    });
+
+    // Route to initiate login flow with LoI backend (CSRF disabled version)
+    // Note: Even with CSRF disabled for ST itself, the state parameter is still crucial
+    // for the OAuth-like flow to prevent CSRF during the redirect dance.
+    app.get('/auth/initiate-loi-login', (req, res) => {
+        if (!req.session) {
+            console.error('Session not available for initiating LoI login.');
+            return res.status(500).json({ error: 'Session unavailable.' });
+        }
+
+        const state = crypto.randomBytes(16).toString('hex');
+        req.session.loiAuthState = state;
+
+        // TODO: Get LoI base URL from config/environment variable
+        const loiBaseUrl = process.env.LOI_BASE_URL || 'https://your-loi-backend.onrender.com'; // Replace with actual LoI URL
+        const loiInitiateUrl = `${loiBaseUrl}/auth/st-initiate/?state=${state}`;
+
+        console.log(`Initiating LoI login (CSRF disabled). State: ${state}. Redirect URL: ${loiInitiateUrl}`); // Log for debugging
+
+        res.json({ loiAuthUrl: loiInitiateUrl });
+    });
+
+    // LoI Authentication Callback Route
+    app.get('/auth/callback', (req, res) => {
+        const { access_token, refresh_token, state } = req.query;
+        const expectedState = req.session?.loiAuthState;
+
+        // Clear the state from session regardless of success or failure
+        if (req.session) {
+            delete req.session.loiAuthState;
+        }
+
+        // Verify state parameter for CSRF protection
+        if (!state || !expectedState || state !== expectedState) {
+            console.error('LoI Auth Callback Error: Invalid state parameter.');
+            // Redirect to login or an error page
+            return res.redirect('/login?error=invalid_state');
+        }
+
+        // Check if tokens were received
+        if (!access_token || !refresh_token) {
+            console.error('LoI Auth Callback Error: Missing tokens.');
+            // Redirect to login or an error page
+            return res.redirect('/login?error=missing_tokens');
+        }
+
+        // Store tokens securely in the session
+        if (req.session) {
+            req.session.loiAccessToken = access_token;
+            req.session.loiRefreshToken = refresh_token;
+            // Mark the session as authenticated via LoI (optional, but can be useful)
+            req.session.isAuthenticatedWithLoI = true;
+            // Touch the session to update its expiry? cookie-session might do this automatically
+            // req.session.nowInMinutes = Math.floor(Date.now() / 60e3);
+
+            console.log('LoI Authentication successful. Tokens stored in session.');
+
+            // Redirect user to the main application page
+            return res.redirect('/');
+        } else {
+            console.error('LoI Auth Callback Error: Session not available to store tokens.');
+            // This case should ideally not happen if session middleware is working
+            return res.redirect('/login?error=session_error');
+        }
+    });
+
+    // LoI Logout Route
+    app.post('/auth/logout', (req, res) => { // Use POST for actions that change state
+        if (req.session) {
+            // Clear LoI specific session data
+            delete req.session.loiAccessToken;
+            delete req.session.loiRefreshToken;
+            delete req.session.isAuthenticatedWithLoI;
+            // Optionally destroy the whole session if appropriate,
+            // or just clear the LoI parts if ST has its own separate login state.
+            // For simplicity here, we just clear LoI parts.
+            // req.session = null; // Destroys the session
+
+            console.log('LoI tokens cleared from session during logout.');
+
+            // TODO: Optionally call LoI backend to invalidate refresh token
+
+            res.status(200).json({ message: 'Logged out successfully' });
+            // Or redirect: res.redirect('/login');
+            // Sending JSON might be better if called via fetch from frontend JS
+        } else {
+            // Session doesn't exist, maybe already logged out or error
+            res.status(200).json({ message: 'No active session found' });
+        }
     });
 }
 
@@ -232,6 +348,228 @@ app.get('/api/ping', (request, response) => {
 
     response.sendStatus(204);
 });
+
+// --- LoI API Proxy Routes ---
+
+// Helper function to refresh LoI tokens
+async function refreshLoIToken(req) {
+    if (!req.session?.loiRefreshToken) {
+        console.error('LoI Refresh Error: No refresh token found in session.');
+        return false; // Indicate refresh failure
+    }
+
+    const refreshToken = req.session.loiRefreshToken;
+    // TODO: Get LoI base URL from config/environment variable
+    const loiBaseUrl = process.env.LOI_BASE_URL || 'https://your-loi-backend.onrender.com'; // Replace with actual LoI URL
+    const loiRefreshUrl = `${loiBaseUrl}/api/auth/tokens/refresh/`; // Assuming this is the LoI refresh endpoint
+
+    console.log(`Attempting to refresh LoI token using endpoint: ${loiRefreshUrl}`);
+
+    try {
+        const refreshResponse = await fetch(loiRefreshUrl, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+            },
+            body: JSON.stringify({ refresh: refreshToken }), // Assuming LoI expects { "refresh": "..." }
+        });
+
+        if (!refreshResponse.ok) {
+            const errorBody = await refreshResponse.text();
+            console.error(`LoI Refresh Error: Refresh request failed with status ${refreshResponse.status}. Body: ${errorBody}`);
+            // Clear potentially invalid tokens from session if refresh fails (important!)
+            if (req.session) {
+                delete req.session.loiAccessToken;
+                delete req.session.loiRefreshToken;
+                delete req.session.isAuthenticatedWithLoI;
+                console.log('Cleared LoI tokens from session due to refresh failure.');
+            }
+            return false; // Indicate refresh failure
+        }
+
+        // Assuming LoI refresh endpoint returns { "access": "...", "refresh": "..." (optional) }
+        const newTokensUnknown = await refreshResponse.json();
+
+        // Type check for the expected token structure
+        const isValidTokenResponse = (data) => {
+            return typeof data === 'object' && data !== null && typeof data.access === 'string';
+        };
+
+        if (!isValidTokenResponse(newTokensUnknown)) {
+             console.error('LoI Refresh Error: Refresh response did not contain a valid access token structure.');
+             // Clear potentially invalid tokens
+             if (req.session) {
+                delete req.session.loiAccessToken;
+                delete req.session.loiRefreshToken;
+                delete req.session.isAuthenticatedWithLoI;
+            }
+             return false;
+        }
+
+        // Now we know newTokensUnknown has at least an 'access' property of type string
+        // Now we know newTokensUnknown has at least an 'access' property of type string
+        // Update session with new tokens *within the validated scope*
+        if (req.session) {
+            // Directly use the validated object's properties
+            // @ts-ignore - Suppress error as type is validated by isValidTokenResponse
+            req.session.loiAccessToken = newTokensUnknown.access;
+            // Update refresh token ONLY if LoI sends a new one (implementing rotation)
+            // Check if refresh property exists and is a string on the validated object
+            // @ts-ignore - Suppress error as type is validated by isValidTokenResponse
+            if (typeof newTokensUnknown.refresh === 'string') {
+                // @ts-ignore - Suppress error as type is validated by isValidTokenResponse
+                req.session.loiRefreshToken = newTokensUnknown.refresh;
+                console.log('LoI token refreshed successfully (with new refresh token).');
+            } else {
+                console.log('LoI token refreshed successfully (reusing existing refresh token).');
+            }
+            return true; // Indicate refresh success
+        } else {
+            // This case should ideally not happen if session is available at the start
+            console.error('LoI Refresh Error: Session not available to store refreshed tokens.');
+            return false; // Indicate refresh failure
+        }
+
+    } catch (error) {
+        console.error('LoI Refresh Error: Network error during token refresh', error);
+        return false; // Indicate refresh failure
+    }
+}
+
+
+// Proxy Route for LoI Characters with Refresh Logic
+app.get('/api/proxy/loi/characters', async (req, res) => {
+    // TODO: Get LoI base URL from config/environment variable
+    const loiBaseUrl = process.env.LOI_BASE_URL || 'https://your-loi-backend.onrender.com'; // Replace with actual LoI URL
+    const loiCharactersUrl = `${loiBaseUrl}/api/v1/characters/`;
+
+    // Function to make the actual API call
+    const makeApiCall = async (token) => {
+        return await fetch(loiCharactersUrl, {
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Accept': 'application/json',
+            },
+        });
+    };
+
+    if (!req.session?.loiAccessToken) {
+        console.error('LoI Proxy Error: Missing access token in session for /characters');
+        return res.status(401).json({ error: 'Not authenticated with LoI' });
+    }
+
+    try {
+        let accessToken = req.session.loiAccessToken;
+        console.log(`Proxying GET request to LoI: ${loiCharactersUrl}`); // Debug log
+        let loiResponse = await makeApiCall(accessToken);
+
+        // Check if token expired (401 Unauthorized)
+        if (loiResponse.status === 401) {
+            console.log('LoI Access Token potentially expired for /characters. Attempting refresh...');
+            const refreshSuccess = await refreshLoIToken(req); // Attempt refresh
+
+            if (refreshSuccess && req.session?.loiAccessToken) {
+                console.log('Token refresh successful. Retrying /characters API call...');
+                accessToken = req.session.loiAccessToken; // Get the new token
+                loiResponse = await makeApiCall(accessToken); // Retry the request
+            } else {
+                console.error('LoI Proxy Error: Token refresh failed or session unavailable for /characters.');
+                // If refresh failed, return 401 to the client to trigger re-login
+                return res.status(401).json({ error: 'Authentication required. Refresh failed.' });
+            }
+        }
+
+        // Forward the status code from LoI (could be success or other error after retry)
+        res.status(loiResponse.status);
+
+        // Stream the response body from LoI back to the client if it exists
+        if (loiResponse.body) {
+            loiResponse.body.pipe(res);
+        } else {
+            res.end();
+        }
+
+        // If you need to inspect/modify the body, you'd do this instead:
+        // if (!loiResponse.ok) {
+        //     const errorBody = await loiResponse.text();
+        //     console.error(`LoI Proxy Error: /characters returned ${loiResponse.status}. Body: ${errorBody}`);
+        //     return res.json({ error: `LoI API Error (${loiResponse.status})`, details: errorBody });
+        // }
+        // const data = await loiResponse.json();
+        // res.json(data);
+
+    } catch (error) {
+        console.error('LoI Proxy Error: Failed to fetch /characters', error);
+        res.status(500).json({ error: 'Failed to contact LoI service' });
+    }
+});
+
+// Proxy Route for LoI Chat with Refresh Logic
+app.post('/api/proxy/loi/chat', async (req, res) => {
+    // TODO: Get LoI base URL from config/environment variable
+    const loiBaseUrl = process.env.LOI_BASE_URL || 'https://your-loi-backend.onrender.com'; // Replace with actual LoI URL
+    const loiChatUrl = `${loiBaseUrl}/api/v1/chat/`;
+
+    // Function to make the actual API call
+    const makeApiCall = async (token, body) => {
+        return await fetch(loiChatUrl, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+            },
+            body: JSON.stringify(body),
+        });
+    };
+
+    if (!req.session?.loiAccessToken) {
+        console.error('LoI Proxy Error: Missing access token in session for /chat');
+        return res.status(401).json({ error: 'Not authenticated with LoI' });
+    }
+
+    try {
+        let accessToken = req.session.loiAccessToken;
+        const requestBody = req.body; // Capture original request body
+        console.log(`Proxying POST request to LoI: ${loiChatUrl}`); // Debug log
+        let loiResponse = await makeApiCall(accessToken, requestBody);
+
+        // Check if token expired (401 Unauthorized)
+        if (loiResponse.status === 401) {
+            console.log('LoI Access Token potentially expired for /chat. Attempting refresh...');
+            const refreshSuccess = await refreshLoIToken(req); // Attempt refresh
+
+            if (refreshSuccess && req.session?.loiAccessToken) {
+                console.log('Token refresh successful. Retrying /chat API call...');
+                accessToken = req.session.loiAccessToken; // Get the new token
+                loiResponse = await makeApiCall(accessToken, requestBody); // Retry the request with original body
+            } else {
+                console.error('LoI Proxy Error: Token refresh failed or session unavailable for /chat.');
+                // If refresh failed, return 401 to the client to trigger re-login
+                return res.status(401).json({ error: 'Authentication required. Refresh failed.' });
+            }
+        }
+
+        // Forward the status code from LoI (could be success or other error after retry)
+        res.status(loiResponse.status);
+
+        // Stream the response body from LoI back to the client if it exists
+        if (loiResponse.body) {
+            loiResponse.body.pipe(res);
+        } else {
+            res.end();
+        }
+
+    } catch (error) {
+        console.error('LoI Proxy Error: Failed to fetch /chat', error);
+        res.status(500).json({ error: 'Failed to contact LoI service' });
+    }
+});
+
+// --- End LoI API Proxy Routes ---
+
 
 // File uploads
 const uploadsPath = path.join(cliArgs.dataRoot, UPLOADS_DIRECTORY);
